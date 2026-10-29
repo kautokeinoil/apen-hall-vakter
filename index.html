@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Åpen hall – vaktliste</title>
+<link rel="stylesheet" href="style.css">
+<script src="config.js"></script>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>Åpen hall</h1>
+  <p>Kautokeino IL · Bakteharji · fredager 19–23</p>
+  <nav><a href="index.html" class="on">Vaktliste</a><a href="info.html">Praktisk info</a></nav>
+</div></header>
+
+<main class="wrap">
+  <div id="mockbar" class="mock" hidden>Testmodus: ingen server er koblet til. Endringer lagres bare i denne nettleseren. Admin-PIN i testmodus: <b>1234</b>.</div>
+  <div id="adminbar" class="adminbar" hidden><span>Admin-modus: «Avlys» stiller inn en fredag, × fjerner navn.</span><button id="logout" class="link">Logg ut</button></div>
+
+  <p class="intro">Trykk på en ledig plass for å ta vakt. Det skal alltid være <strong>to voksne</strong> per kveld.</p>
+  <div class="legend"><span class="lg full">2 voksne</span><span class="lg half">Mangler 1</span><span class="lg">Ingen ennå</span><span class="lg cancelled">Avlyst</span></div>
+
+  <button id="pastbtn" class="link pastbtn" hidden></button>
+  <div class="head"><span>Dato</span><span>Voksen 1</span><span>Voksen 2</span></div>
+  <div id="list" aria-live="polite"><p class="loading">Laster vaktlista …</p></div>
+
+  <p class="foot"><span id="updated"></span> · <button id="adminbtn" class="link">Admin</button></p>
+</main>
+
+<dialog id="dlg"><form method="dialog">
+  <h2 id="dlgtitle"></h2>
+  <p id="dlgtext"></p>
+  <input id="dlginput" autocomplete="name" maxlength="40">
+  <div class="btns"><button value="ok" id="dlgok" class="pri">OK</button><button value="cancel" class="sec" formnovalidate>Avbryt</button></div>
+</form></dialog>
+<div id="toast" role="status"></div>
+
+<script>
+(function(){
+const API = (window.KIL_CONFIG && window.KIL_CONFIG.API_URL || '').trim();
+const MOCK = !API;
+const MND = ['jan','feb','mar','apr','mai','jun','jul','aug','sep','okt','nov','des'];
+const $ = s => document.querySelector(s);
+let rows = [], busy = false, showPast = false;
+let pin = ''; try{ pin = sessionStorage.getItem('kil_pin') || ''; }catch(e){}
+
+/* ---------- små hjelpere ---------- */
+function el(tag, cls, text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e; }
+function iso(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function toast(msg, err){ const t=$('#toast'); t.textContent=msg; t.className='show'+(err?' err':''); clearTimeout(t._h); t._h=setTimeout(()=>t.className=err?'err':'', err?5000:2800); }
+function tokens(){ try{ return JSON.parse(localStorage.getItem('kil_tokens')||'{}'); }catch(e){ return {}; } }
+function setTok(k,v){ try{ const o=tokens(); if(v) o[k]=v; else delete o[k]; localStorage.setItem('kil_tokens', JSON.stringify(o)); }catch(e){} }
+function lastName(){ try{ return localStorage.getItem('kil_name')||''; }catch(e){ return ''; } }
+function setLastName(n){ try{ localStorage.setItem('kil_name', n); }catch(e){} }
+function newToken(){ const a=new Uint8Array(16); crypto.getRandomValues(a); return Array.from(a,b=>b.toString(16).padStart(2,'0')).join(''); }
+function setBusy(b){ busy=b; document.querySelectorAll('main button').forEach(x=>x.disabled=b); }
+
+/* ---------- dialog ---------- */
+function ask(o){
+  return new Promise(res=>{
+    const dlg=$('#dlg'), inp=$('#dlginput'), input=o.input!==false;
+    $('#dlgtitle').textContent=o.title; $('#dlgtext').textContent=o.text||''; $('#dlgtext').hidden=!o.text;
+    inp.hidden=!input; inp.required=!!o.required; inp.type=o.type||'text'; inp.value=o.value||''; inp.placeholder=o.placeholder||'';
+    inp.inputMode = o.type==='password' ? 'numeric' : 'text';
+    $('#dlgok').textContent=o.ok||'OK';
+    dlg.returnValue='';
+    dlg.onclose=()=>res(dlg.returnValue==='ok' ? (input ? inp.value.trim() : true) : null);
+    dlg.showModal(); if(input) setTimeout(()=>inp.focus(),40);
+  });
+}
+
+/* ---------- API ---------- */
+async function api(action, data){
+  data = data||{};
+  if(MOCK) return mockApi(action, data);
+  let res;
+  if(action==='list') res = await fetch(API+'?action=list&t='+Date.now());
+  else res = await fetch(API, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(Object.assign({action}, data))});
+  const j = await res.json();
+  if(!j.ok) throw new Error(j.error||'Ukjent feil');
+  return j;
+}
+async function run(action, data, okMsg){
+  setBusy(true);
+  try{
+    const j = await api(action, data);
+    rows = j.rows; render(); stamp();
+    if(okMsg) toast(okMsg);
+    return true;
+  }catch(e){
+    if(/PIN/i.test(e.message) && pin){ logout(true); }
+    toast(e.message || 'Fikk ikke kontakt med serveren.', true);
+    if(action!=='list') load();
+    return false;
+  }finally{ setBusy(false); }
+}
+function load(){ return run('list'); }
+function stamp(){ $('#updated').textContent='Oppdatert '+new Date().toLocaleTimeString('no-NO',{hour:'2-digit',minute:'2-digit'}); }
+
+/* ---------- visning ---------- */
+function render(){
+  const list=$('#list'); list.innerHTML='';
+  const today=iso(new Date());
+  const past=rows.filter(r=>r.date<today);
+  const pb=$('#pastbtn');
+  pb.hidden=!past.length;
+  pb.textContent = showPast ? 'Skjul tidligere fredager' : 'Vis '+past.length+' tidligere fredag'+(past.length>1?'er':'');
+  let nextDone=false;
+  rows.forEach(r=>{
+    const isPast=r.date<today;
+    if(isPast && !showPast) return;
+    const row=el('div','row');
+    const n=(r.n1?1:0)+(r.n2?1:0);
+    if(r.cancelled) row.classList.add('cancelled');
+    else if(isPast) row.classList.add('past');
+    else row.classList.add(n===2?'full':n===1?'half':'empty');
+    const dc=el('div','date');
+    dc.append(el('span','d',r.label));
+    if(!isPast && !nextDone){ row.classList.add('next'); nextDone=true; if(!r.cancelled) dc.append(el('span','tag nexttag','Neste')); }
+    if(r.cancelled){ dc.append(el('span','tag','Avlyst')); if(r.note) dc.append(el('span','note',r.note)); }
+    if(pin){ const b=el('button','adm', r.cancelled?'Gjenåpne':'Avlys'); b.onclick=()=>toggleCancel(r); dc.append(b); }
+    row.append(dc, slot(r,1,isPast), slot(r,2,isPast));
+    list.append(row);
+  });
+  if(!list.children.length) list.append(el('p','loading','Ingen fredager å vise.'));
+  if(busy) setBusy(true);
+}
+function slot(r,i,isPast){
+  const name=r['n'+i], key=r.date+'#'+i, c=el('div','slot');
+  if(name){
+    c.append(el('span','name',name));
+    const t=tokens()[key];
+    const mine = !!(t && t.name===name);
+    if((mine && !isPast) || pin){ const b=el('button','x','×'); b.title='Fjern navn'; b.setAttribute('aria-label','Fjern '+name); b.onclick=()=>removeName(r,i,name,mine); c.append(b); }
+  } else if(!r.cancelled && (!isPast || pin)){
+    const b=el('button','free','Ledig · ta vakt'); b.onclick=()=>signup(r,i); c.append(b);
+  } else c.append(el('span','dash','–'));
+  return c;
+}
+
+/* ---------- handlinger ---------- */
+async function signup(r,i){
+  const name = await ask({title:'Ta vakt '+r.label, text:'Skriv for- og etternavn, så de andre vet hvem du er.', value:lastName(), required:true, ok:'Meld meg på', placeholder:'Fornavn Etternavn'});
+  if(!name) return;
+  setLastName(name);
+  const token=newToken();
+  const ok = await run('signup', {date:r.date, slot:i, name, token, pin}, 'Takk! Du står på '+r.label+'.');
+  if(ok){ const rr=rows.find(x=>x.date===r.date); if(rr && rr['n'+i]) setTok(r.date+'#'+i, {t:token, name:rr['n'+i]}); render(); }
+}
+async function removeName(r,i,name,mine){
+  const yes = await ask({title:'Fjerne '+name+'?', text: mine ? 'Du melder deg av '+r.label+'. Plassen blir ledig for andre.' : 'Admin: fjerner navnet fra '+r.label+'.', input:false, ok:'Fjern'});
+  if(!yes) return;
+  const key=r.date+'#'+i, t=tokens()[key];
+  const ok = await run('remove', {date:r.date, slot:i, token: t?t.t:'', pin}, 'Navnet er fjernet.');
+  if(ok){ setTok(key,null); render(); }
+}
+async function toggleCancel(r){
+  if(!r.cancelled){
+    const note = await ask({title:'Avlyse '+r.label+'?', text:'Grunn (valgfritt). Vises på lista, f.eks. «Annet arrangement i hallen».', ok:'Avlys', placeholder:'Grunn'});
+    if(note===null) return;
+    run('cancel', {date:r.date, cancelled:true, note, pin}, r.label+' er avlyst.');
+  } else {
+    const yes = await ask({title:'Gjenåpne '+r.label+'?', input:false, ok:'Gjenåpne'});
+    if(yes) run('cancel', {date:r.date, cancelled:false, pin}, r.label+' er åpen igjen.');
+  }
+}
+function adminUi(){ $('#adminbar').hidden=!pin; $('#adminbtn').hidden=!!pin; }
+function logout(silent){ pin=''; try{ sessionStorage.removeItem('kil_pin'); }catch(e){} adminUi(); render(); if(!silent) toast('Logget ut av admin.'); }
+
+$('#adminbtn').onclick = async ()=>{
+  const p = await ask({title:'Admin', text:'Skriv PIN-koden.', type:'password', required:true, ok:'Logg inn'});
+  if(!p) return;
+  setBusy(true);
+  try{ await api('checkpin',{pin:p}); pin=p; try{ sessionStorage.setItem('kil_pin',p); }catch(e){} adminUi(); render(); toast('Admin-modus er på.'); }
+  catch(e){ toast(e.message,true); }
+  finally{ setBusy(false); }
+};
+$('#logout').onclick = ()=>logout();
+$('#pastbtn').onclick = ()=>{ showPast=!showPast; render(); };
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && !busy && !$('#dlg').open) load(); });
+
+/* ---------- testmodus (uten server) ---------- */
+function genDates(){
+  const out=[], d=new Date(2026,9,30,12), end=new Date(2027,2,19,12);
+  while(d<=end){ out.push({date:iso(d), label:d.getDate()+' '+MND[d.getMonth()]}); d.setDate(d.getDate()+7); }
+  return out;
+}
+async function mockApi(action,d){
+  let db; try{ db=JSON.parse(localStorage.getItem('kil_mock')||'null'); }catch(e){}
+  if(!db) db=genDates().map(x=>Object.assign(x,{n1:'',n2:'',t1:'',t2:'',cancelled:false,note:''}));
+  const PIN='1234', find=()=>{ const r=db.find(x=>x.date===d.date); if(!r) throw new Error('Fant ikke datoen.'); return r; };
+  const needPin=()=>{ if(String(d.pin)!==PIN) throw new Error('Feil PIN-kode.'); };
+  if(action==='checkpin') needPin();
+  else if(action==='signup'){
+    const r=find(), i=Number(d.slot), name=String(d.name||'').replace(/\s+/g,' ').trim().slice(0,40);
+    if(name.length<2) throw new Error('Skriv inn navnet ditt.');
+    if(r.cancelled) throw new Error('Denne fredagen er avlyst.');
+    if(r['n'+i]) throw new Error('Noen rakk å ta plassen før deg. Lista er oppdatert.');
+    if([r.n1,r.n2].some(n=>n && n.toLowerCase()===name.toLowerCase())) throw new Error('Du står allerede på denne fredagen.');
+    r['n'+i]=name; r['t'+i]=d.token;
+  } else if(action==='remove'){
+    const r=find(), i=Number(d.slot);
+    if(!(d.token && d.token===r['t'+i])) needPin();
+    r['n'+i]=''; r['t'+i]='';
+  } else if(action==='cancel'){
+    needPin(); const r=find(); r.cancelled=!!d.cancelled; r.note=r.cancelled?String(d.note||'').slice(0,80):'';
+  }
+  try{ localStorage.setItem('kil_mock',JSON.stringify(db)); }catch(e){}
+  return {ok:true, rows:db.map(r=>({date:r.date,label:r.label,n1:r.n1,n2:r.n2,cancelled:r.cancelled,note:r.note}))};
+}
+
+$('#mockbar').hidden=!MOCK;
+adminUi();
+load();
+})();
+</script>
+</body>
+</html>
